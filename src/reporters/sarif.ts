@@ -46,7 +46,6 @@ interface SarifResult {
   locations: SarifLocation[];
   relatedLocations?: SarifRelatedLocation[];
   partialFingerprints?: Record<string, string>;
-  fixes?: { description: { text: string } }[];
   properties?: Record<string, unknown>;
 }
 
@@ -157,7 +156,9 @@ export function reportSarif(result: ScanResult, outputPath?: string): string {
       ruleId: finding.ruleId,
       ruleIndex,
       level: severityToLevel(finding.severity),
-      message: { text: `${finding.title}: ${finding.description}` },
+      message: { text: finding.remediation
+        ? `${finding.title}: ${finding.description}\n\nRemediation: ${finding.remediation}`
+        : `${finding.title}: ${finding.description}` },
       locations: [
         {
           physicalLocation: {
@@ -178,10 +179,6 @@ export function reportSarif(result: ScanResult, outputPath?: string): string {
         ),
       },
     };
-
-    if (finding.remediation) {
-      sarifResult.fixes = [{ description: { text: finding.remediation } }];
-    }
 
     if (finding.standards) {
       sarifResult.properties = { standards: finding.standards };
