@@ -1,6 +1,9 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import ignore from 'ignore';
+import _ignore from 'ignore';
+
+// Handle ESM/CJS interop — the `ignore` package may export .default at runtime
+const ignore = (_ignore as any).default || _ignore;
 import type { FileInfo, FileInventory } from '../types/common.js';
 
 const DEFAULT_IGNORE = [
@@ -38,7 +41,7 @@ const CONFIG_NAMES = new Set([
 ]);
 
 export async function walkDirectory(rootPath: string, excludePaths?: string[]): Promise<FileInventory> {
-  const ig = ignore.default();
+  const ig = ignore();
   ig.add(DEFAULT_IGNORE);
 
   if (excludePaths && excludePaths.length > 0) {
@@ -60,7 +63,7 @@ export async function walkDirectory(rootPath: string, excludePaths?: string[]): 
 function walkRecursive(
   dir: string,
   rootPath: string,
-  ig: ReturnType<typeof ignore.default>,
+  ig: ReturnType<typeof ignore>,
   files: FileInfo[],
 ): void {
   let entries: fs.Dirent[];
