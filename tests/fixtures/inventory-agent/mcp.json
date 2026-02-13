@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "knowledge-server": {
+      "command": "python",
+      "args": ["server.py"]
+    }
+  }
+}
