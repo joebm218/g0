@@ -45,33 +45,128 @@ export function removePid(pidFile: string): void {
 
 /**
  * Fork and detach the daemon process.
- * Returns the child PID, or null if we ARE the child (should start running).
+ * Returns the child PID on success. Throws if the child exits immediately.
+ *
+ * The child's stdout/stderr are redirected to a startup log file so that
+ * errors during module loading or early initialization (before the daemon
+ * logger is ready) are captured instead of being silently swallowed.
+ *
+ * An IPC channel is kept open briefly so the child can signal "ready"
+ * once its logger is initialized. If the child exits before signalling,
+ * the startup log is included in the thrown error.
  */
-export function forkDaemon(pidFile: string): number | null {
+export async function forkDaemon(pidFile: string): Promise<number> {
   // Check if already running
   const existing = readPid(pidFile);
   if (existing !== null) {
     throw new Error(`Daemon already running (PID ${existing})`);
   }
 
-  // Resolve path to the daemon runner entry point
-  // In development: tsx src/daemon/runner.ts
-  // In production: node dist/src/daemon/runner.js
   const runnerPath = resolveRunnerPath();
+
+  // Capture early stdout/stderr to a file so errors before logger init are not lost.
+  // Truncate on each start so the file doesn't grow unbounded across restarts.
+  const startupLogPath = path.join(path.dirname(pidFile), 'daemon-startup.log');
+  fs.mkdirSync(path.dirname(pidFile), { recursive: true, mode: 0o700 });
+  const startupLogFd = fs.openSync(startupLogPath, 'w', 0o600);
 
   const child = childProcess.fork(runnerPath, [], {
     detached: true,
-    stdio: 'ignore',
-    env: { ...process.env, G0_DAEMON: '1' },
+    stdio: ['ignore', startupLogFd, startupLogFd, 'ipc'],
+    env: { ...process.env, G0_DAEMON: '1', G0_DAEMON_STARTUP_LOG: startupLogPath },
   });
 
-  if (child.pid) {
-    writePid(pidFile, child.pid);
-    child.unref();
-    return child.pid;
+  if (!child.pid) {
+    fs.closeSync(startupLogFd);
+    throw new Error('Failed to fork daemon process');
   }
 
-  throw new Error('Failed to fork daemon process');
+  // writePid can throw (e.g. read-only filesystem) — ensure the fd is closed
+  try {
+    writePid(pidFile, child.pid);
+  } catch (err) {
+    fs.closeSync(startupLogFd);
+    child.kill();
+    throw err;
+  }
+
+  // Wait for the child to signal readiness or exit
+  const pid = await new Promise<number>((resolve, reject) => {
+    let settled = false;
+
+    const cleanup = () => {
+      child.removeAllListeners('message');
+      child.removeAllListeners('exit');
+    };
+
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn();
+    };
+
+    const timer = setTimeout(() => {
+      settle(() => {
+        // Timeout — check if process is still alive
+        try {
+          process.kill(child.pid!, 0);
+          // Still running (slow init) — detach and report success
+          child.unref();
+          child.disconnect?.();
+          fs.closeSync(startupLogFd);
+          resolve(child.pid!);
+        } catch {
+          // Child already exited during the wait window
+          fs.closeSync(startupLogFd);
+          const log = readStartupLog(startupLogPath);
+          removePid(pidFile);
+          reject(new Error(
+            `Daemon process exited immediately after fork.` +
+            (log ? `\nStartup log:\n${log}` : '\nNo startup log captured — check the runner path and Node.js version.'),
+          ));
+        }
+      });
+    }, 3000);
+
+    child.on('message', (msg: unknown) => {
+      if (msg && typeof msg === 'object' && (msg as Record<string, unknown>).type === 'daemon-ready') {
+        settle(() => {
+          clearTimeout(timer);
+          child.unref();
+          child.disconnect?.();
+          fs.closeSync(startupLogFd);
+          resolve(child.pid!);
+        });
+      }
+    });
+
+    child.on('exit', (code) => {
+      settle(() => {
+        clearTimeout(timer);
+        fs.closeSync(startupLogFd);
+        const log = readStartupLog(startupLogPath);
+        removePid(pidFile);
+        reject(new Error(
+          `Daemon process exited with code ${code ?? 'unknown'}.` +
+          (log ? `\nStartup log:\n${log}` : '\nNo startup log captured.'),
+        ));
+      });
+    });
+  });
+
+  return pid;
+}
+
+function readStartupLog(logPath: string): string {
+  try {
+    const content = fs.readFileSync(logPath, 'utf-8').trim();
+    // Return last 20 lines to keep error messages manageable
+    const lines = content.split('\n');
+    return lines.slice(-20).join('\n');
+  } catch {
+    return '';
+  }
 }
 
 /**
@@ -92,12 +187,6 @@ export function stopDaemon(pidFile: string): boolean {
 }
 
 function resolveRunnerPath(): string {
-  // Check for compiled version first
-  const compiledPath = path.resolve(
-    import.meta.url.replace('file://', '').replace('/daemon/process.js', ''),
-    '../daemon/runner.js',
-  );
-
   // In dist/ context
   try {
     const distPath = path.resolve(__dirname, '../daemon/runner.js');
@@ -111,6 +200,17 @@ function resolveRunnerPath(): string {
   const candidate = path.join(thisDir, 'runner.js');
   if (fs.existsSync(candidate)) return candidate;
 
-  // Fallback: assume we're in src/ or dist/
-  return compiledPath;
+  // Fallback via import.meta.url
+  const compiledPath = path.resolve(
+    import.meta.url.replace('file://', '').replace('/daemon/process.js', ''),
+    '../daemon/runner.js',
+  );
+  if (fs.existsSync(compiledPath)) return compiledPath;
+
+  throw new Error(
+    `Cannot find daemon runner.js. Searched:\n` +
+    `  ${candidate}\n` +
+    `  ${compiledPath}\n` +
+    `Ensure g0 is installed correctly.`,
+  );
 }
