@@ -2,7 +2,7 @@
   "id": "g0-openclaw-plugin",
   "name": "Guard0 Security Plugin",
   "description": "In-process security monitoring for OpenClaw — injection detection, PII scanning, tool blocking, event streaming to g0 daemon",
-  "version": "1.0.0",
+  "version": "0.1.1",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
